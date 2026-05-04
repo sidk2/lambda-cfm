@@ -48,7 +48,6 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.channels = channels
         self.mha = nn.MultiheadAttention(channels, 1, batch_first=True)
-        self.ln = nn.LayerNorm([channels])
         self.ff_self = nn.Sequential(
             nn.LayerNorm([channels]),
             nn.Linear(channels, channels),
@@ -81,8 +80,8 @@ class UpsamplingUNetConv(nn.Module):
         out_channels: int,
         int_channels: int | None = None,
         residual: bool = False,
-        time_dim: int = 256,
-        latent_vec_dim: int = 14,
+        time_dim: int | None = 256,
+        latent_vec_dim: int | None = None,
     ):
         super().__init__()
         self.residual = residual
@@ -95,15 +94,24 @@ class UpsamplingUNetConv(nn.Module):
         self.conv2 = subpel_conv3x3(in_ch=int_channels, out_ch=out_channels, r=2)
         self.gn_2 = AdaGN(num_channels=out_channels, num_groups=compute_groups(out_channels))
 
-        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels)
-        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels)
+        # Residual skip path: upsample 2x to match sub-pixel conv, project channels if needed.
+        if residual:
+            skip_layers: list[nn.Module] = [nn.Upsample(scale_factor=2, mode="nearest")]
+            if in_channels != out_channels:
+                skip_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False))
+            self.skip_proj = nn.Sequential(*skip_layers)
+        else:
+            self.skip_proj = None
 
-        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels)
-        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels)
+        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels) if time_dim is not None else None
+        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels) if time_dim is not None else None
+        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels) if time_dim is not None else None
+        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels) if time_dim is not None else None
+
+        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels) if latent_vec_dim is not None else None
+        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels) if latent_vec_dim is not None else None
+        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels) if latent_vec_dim is not None else None
+        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels) if latent_vec_dim is not None else None
 
     def forward(
         self,
@@ -111,23 +119,25 @@ class UpsamplingUNetConv(nn.Module):
         t: torch.Tensor | None = None,
         z: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        t_s1 = self.t_scale_proj_1(t) if t is not None else None
-        t_b1 = self.t_bias_proj_1(t) if t is not None else None
-        t_s2 = self.t_scale_proj_2(t) if t is not None else None
-        t_b2 = self.t_bias_proj_2(t) if t is not None else None
+        t_s1 = self.t_scale_proj_1(t) if self.t_scale_proj_1 is not None and t is not None else None
+        t_b1 = self.t_bias_proj_1(t) if self.t_bias_proj_1 is not None and t is not None else None
+        t_s2 = self.t_scale_proj_2(t) if self.t_scale_proj_2 is not None and t is not None else None
+        t_b2 = self.t_bias_proj_2(t) if self.t_bias_proj_2 is not None and t is not None else None
 
-        z_s1 = self.z_scale_proj_1(z) if z is not None else None
-        z_b1 = self.z_bias_proj_1(z) if z is not None else None
-        z_s2 = self.z_scale_proj_2(z) if z is not None else None
-        z_b2 = self.z_bias_proj_2(z) if z is not None else None
+        z_s1 = self.z_scale_proj_1(z) if self.z_scale_proj_1 is not None and z is not None else None
+        z_b1 = self.z_bias_proj_1(z) if self.z_bias_proj_1 is not None and z is not None else None
+        z_s2 = self.z_scale_proj_2(z) if self.z_scale_proj_2 is not None and z is not None else None
+        z_b2 = self.z_bias_proj_2(z) if self.z_bias_proj_2 is not None and z is not None else None
 
+        identity = x
         x = self.conv1(x)
         x = self.gn_1(x, t_s1, t_b1, z_s1, z_b1)
         x = self.gelu(x)
         x = self.conv2(x)
         x = self.gn_2(x, t_s2, t_b2, z_s2, z_b2)
-        x = x + self.gelu(x)
-        return x
+        if self.residual and self.skip_proj is not None:
+            x = x + self.skip_proj(identity)
+        return self.gelu(x)
 
 
 class UNetConv(nn.Module):
@@ -137,10 +147,10 @@ class UNetConv(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        time_dim: int,
+        time_dim: int | None,
         int_channels: int | None = None,
         residual: bool = False,
-        latent_vec_dim: int = 14 * 9,
+        latent_vec_dim: int | None = None,
     ):
         super().__init__()
         self.residual = residual
@@ -157,15 +167,25 @@ class UNetConv(nn.Module):
         )
         self.gn_2 = AdaGN(num_channels=out_channels, num_groups=compute_groups(out_channels))
 
-        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels)
-        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels)
+        # Residual skip path: project channels via 1x1 conv if needed.
+        if residual:
+            self.skip_proj: nn.Module = (
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+                if in_channels != out_channels
+                else nn.Identity()
+            )
+        else:
+            self.skip_proj = None  # type: ignore[assignment]
 
-        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels)
-        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels)
+        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels) if time_dim is not None else None
+        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels) if time_dim is not None else None
+        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels) if time_dim is not None else None
+        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels) if time_dim is not None else None
+
+        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels) if latent_vec_dim is not None else None
+        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels) if latent_vec_dim is not None else None
+        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels) if latent_vec_dim is not None else None
+        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels) if latent_vec_dim is not None else None
 
     def forward(
         self,
@@ -173,23 +193,25 @@ class UNetConv(nn.Module):
         t: torch.Tensor | None = None,
         z: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        t_s1 = self.t_scale_proj_1(t) if t is not None else None
-        t_b1 = self.t_bias_proj_1(t) if t is not None else None
-        t_s2 = self.t_scale_proj_2(t) if t is not None else None
-        t_b2 = self.t_bias_proj_2(t) if t is not None else None
+        t_s1 = self.t_scale_proj_1(t) if self.t_scale_proj_1 is not None and t is not None else None
+        t_b1 = self.t_bias_proj_1(t) if self.t_bias_proj_1 is not None and t is not None else None
+        t_s2 = self.t_scale_proj_2(t) if self.t_scale_proj_2 is not None and t is not None else None
+        t_b2 = self.t_bias_proj_2(t) if self.t_bias_proj_2 is not None and t is not None else None
 
-        z_s1 = self.z_scale_proj_1(z) if z is not None else None
-        z_b1 = self.z_bias_proj_1(z) if z is not None else None
-        z_s2 = self.z_scale_proj_2(z) if z is not None else None
-        z_b2 = self.z_bias_proj_2(z) if z is not None else None
+        z_s1 = self.z_scale_proj_1(z) if self.z_scale_proj_1 is not None and z is not None else None
+        z_b1 = self.z_bias_proj_1(z) if self.z_bias_proj_1 is not None and z is not None else None
+        z_s2 = self.z_scale_proj_2(z) if self.z_scale_proj_2 is not None and z is not None else None
+        z_b2 = self.z_bias_proj_2(z) if self.z_bias_proj_2 is not None and z is not None else None
 
+        identity = x
         x = self.conv1(x)
         x = self.gn_1(x, t_s1, t_b1, z_s1, z_b1)
         x = self.gelu(x)
         x = self.conv2(x)
         x = self.gn_2(x, t_s2, t_b2, z_s2, z_b2)
-        x = x + self.gelu(x)
-        return x
+        if self.residual and self.skip_proj is not None:
+            x = x + self.skip_proj(identity)
+        return self.gelu(x)
 
 
 class DownStep(nn.Module):
@@ -267,11 +289,12 @@ class UpStepWoutRes(nn.Module):
         self.conv1 = UNetConv(
             in_channels=in_channels, 
             out_channels=in_channels, 
-            time_dim=time_dim, 
+            time_dim=None, 
+            latent_vec_dim=None,
         )
         self.conv2 = UpsamplingUNetConv(
             in_channels=in_channels, int_channels=in_channels // 2,
-            out_channels=out_channels, residual=True, time_dim=time_dim,
+            out_channels=out_channels, residual=True, time_dim=None, latent_vec_dim=None,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -314,7 +337,13 @@ class UNet(nn.Module):
         c0, c1, c2, c3, c4 = channel_mults
 
         self.dropout = nn.Dropout2d(p=0.1)
-        self.inc = UNetConv(in_channels=n_channels, out_channels=c0, time_dim=time_dim, residual=True)
+        self.inc = UNetConv(
+            in_channels=n_channels, 
+            out_channels=c0, 
+            time_dim=time_dim, 
+            residual=True,
+            latent_vec_dim=latent_vec_dim,
+        )
 
         self.down1 = DownStep(in_channels=c0 + self.num_latent_channels, out_channels=c1, time_dim=time_dim)
         self.down2 = DownStep(in_channels=c1, out_channels=c2, time_dim=time_dim)
@@ -324,7 +353,6 @@ class UNet(nn.Module):
         self.down4 = DownStep(in_channels=c3, out_channels=c4, time_dim=time_dim)
 
         self.up0 = UpStep(in_channels=c4, res_channels=c4, out_channels=c2, time_dim=time_dim)
-        self.sa0_inv = ConditionedSelfAttention(channels=c2, time_dim=time_dim) if conditioned_attention else SelfAttention(channels=c2)
         self.up1 = UpStep(in_channels=c2, res_channels=c2, out_channels=c2, time_dim=time_dim)
         self.sa1_inv = ConditionedSelfAttention(channels=c2, time_dim=time_dim) if conditioned_attention else SelfAttention(channels=c2)
         self.up2 = UpStep(in_channels=c2, res_channels=c1, out_channels=c1, time_dim=time_dim)

@@ -46,7 +46,6 @@ class CosmoFlow(LightningModule):
         use_temporal_masking: bool = True,
         unet_channel_mults: tuple[int, int, int, int, int] = (64, 128, 256, 512, 512),
         conditioned_attention: bool = False,
-        # use_dit_backbone: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -63,7 +62,6 @@ class CosmoFlow(LightningModule):
         self.decoder = fm.FlowMatching(velocity_model)
 
         self.validation_step_outputs: list[dict[str, Any]] = []
-        # self.use_dit_backbone = use_dit_backbone
 
     def _init_encoder(self, in_channels: int) -> nn.Module:
         return resnet.ResNetEncoder(
@@ -72,15 +70,6 @@ class CosmoFlow(LightningModule):
         )
 
     def _init_velocity(self) -> nn.Module:
-        # if self.use_dit_backbone: 
-        #     return dit.DiT(
-        #         input_channels=1,
-        #         depth=4,
-        #         mlp_ratio=2,
-        #         n_heads=4,
-        #         qkv_bias=True,
-        #         latent_img_channels=self.latent_img_channels
-        #     )
         return unet.UNet(
             n_channels=1,
             time_dim=256,
@@ -89,10 +78,6 @@ class CosmoFlow(LightningModule):
             channel_mults=self.unet_channel_mults,
             conditioned_attention=self.conditioned_attention,
         )
-
-    # def configure_model(self):
-    #     self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
-    #     self.decoder = torch.compile(self.decoder, mode="reduce-overhead")
 
     def get_loss(
         self,
@@ -154,7 +139,7 @@ class CosmoFlow(LightningModule):
         plt.close(fig)
 
     def configure_optimizers(self) -> dict[str, Any]:
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-5)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, factor=0.5, patience=10, min_lr=1e-8,
         )
