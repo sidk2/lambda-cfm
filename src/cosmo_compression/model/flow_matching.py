@@ -1,20 +1,20 @@
+"""Flow-matching module with training loss and inference-time ODE integration."""
+
 import torch
 from torch import nn
-import torch.autograd as autograd
 from torchdyn.core import NeuralODE
-from torchdiffeq import odeint
 
 
 class ConditionedVelocityModel(nn.Module):
-    """Neural net for velocity field prediction, with optional reverse flag"""
+    """Wraps a velocity model with optional conditioning and reverse flag."""
 
     def __init__(
         self,
-        velocity_model: torch.nn.Module,
+        velocity_model: nn.Module,
         h: torch.Tensor | None,
         reverse: bool = False,
     ):
-        super(ConditionedVelocityModel, self).__init__()
+        super().__init__()
         self.reverse = reverse
         self.velocity_model = velocity_model
         self.h = h
@@ -24,20 +24,29 @@ class ConditionedVelocityModel(nn.Module):
         t: torch.Tensor | int,
         x: torch.Tensor,
         h: torch.Tensor | None = None,
-        *args,
-        **kwargs,
+        *args: object,
+        **kwargs: object,
     ) -> torch.Tensor:
         if h is None:
             h = self.h
+        
+        # Ensure t is fully batched to match x for the velocity model
+        if isinstance(t, (int, float)):
+            t = torch.tensor([t], device=x.device, dtype=x.dtype)
+        elif t.dim() == 0:
+            t = t.unsqueeze(0)
+        t = t.expand(x.shape[0], 1)
+
         velocity = self.velocity_model(x, t=t, z=h)
         return -velocity if self.reverse else velocity
 
+
 class FlowMatching(nn.Module):
-    """Flow‐matching module with training loss and inference‐time log‐likelihood."""
+    """Flow-matching module with training loss and inference-time log-likelihood."""
 
     def __init__(
         self,
-        velocity_model: torch.nn.Module,
+        velocity_model: nn.Module,
         sigma: float = 0.0,
         reverse: bool = False,
     ):
@@ -47,22 +56,26 @@ class FlowMatching(nn.Module):
         self.reverse = reverse
 
     def get_mu_t(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        '''Sample distribution mean for rectified flow matching'''
+        """Sample distribution mean for rectified flow matching."""
         return t * x1 + (1 - t) * x0
 
     def get_gamma_t(self, t: torch.Tensor) -> torch.Tensor:
-        '''Sample distribution variance for rectified flow matching'''
+        """Sample distribution variance for rectified flow matching."""
         return torch.sqrt(2 * t * (1 - t))
 
     def sample_xt(
-        self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, eps: torch.Tensor | None
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor,
+        eps: torch.Tensor | None,
     ) -> torch.Tensor:
-        '''Sample from distribution at time t'''
+        """Sample from the interpolated distribution at time *t*."""
         t_broadcast = t.view(t.shape[0], *([1] * (x0.dim() - 1)))
         mu_t = self.get_mu_t(x0, x1, t_broadcast)
         if self.sigma != 0.0:
             sigma_t = self.get_gamma_t(t_broadcast)
-            return mu_t + sigma_t * eps
+            return mu_t + sigma_t * eps  # type: ignore[operator]
         return mu_t
 
     def compute_loss(
@@ -72,7 +85,7 @@ class FlowMatching(nn.Module):
         h: torch.Tensor | None = None,
         t: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        '''Flow matching loss'''
+        """Compute the flow-matching MSE loss."""
         if t is None:
             t = torch.rand(x0.shape[0], device=x0.device).type_as(x0)
 
@@ -90,14 +103,12 @@ class FlowMatching(nn.Module):
         solver: str = "dopri5",
         full_return: bool = False,
     ) -> torch.Tensor:
-        '''Run inference by solving probability flow ODE with initial condition x0'''
+        """Run inference by solving the probability-flow ODE from *x0*."""
         conditional_velocity_model = ConditionedVelocityModel(
-            velocity_model=self.velocity_model, h=h, reverse=self.reverse
+            velocity_model=self.velocity_model, h=h, reverse=self.reverse,
         )
         node = NeuralODE(
-            conditional_velocity_model,
-            solver=solver,
-            sensitivity="adjoint",
+            conditional_velocity_model, solver=solver, sensitivity="adjoint",
         )
         with torch.no_grad():
             traj = node.trajectory(

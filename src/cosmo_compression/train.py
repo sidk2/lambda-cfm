@@ -1,45 +1,75 @@
-import os
+"""Training script for CosmoFlow flow-matching compression model."""
 
-import numpy as np
-from pathlib import Path
+import argparse
+import os
 from argparse import ArgumentParser
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+from lightning.pytorch import Trainer, seed_everything
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
-from lightning.pytorch import seed_everything, Trainer
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-
-from cosmo_compression.model import represent
 from cosmo_compression.data import data
+from cosmo_compression.model import represent
 
-torch.cuda.empty_cache()
-torch.set_float32_matmul_precision('medium')
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 5"
+
+@dataclass
+class TrainConfig:
+    """Configuration for flow-matching model training."""
+    output_dir: str
+    root: str
+    run_name: str
+    camels_suite: str
+    camels_data: str
+    learning_rate: float
+    grad_clip: float
+    batch_size: int
+    accumulate_gradients: int | None
+    num_workers: int
+    save_every: int
+    eval_every: int
+    latent_dim: int
+    latent_img_channels: int
+    train_size: int
+    val_size: int
+    max_steps: int
+    max_epochs: int
+    profile: bool
+    gpus: int
+    use_wandb: bool
+    no_temporal_masking: bool
+    conditioned_attention: bool
+    seed: int
+
+
+torch.set_float32_matmul_precision("medium")
+
 
 def get_camels_dataloaders(
-    batch_size,
-    num_workers,
-    idx_train,
-    idx_val,
-    map_type,
-    parameters,
-    suite,
-    camels_data,
-    root,
-):
-    """
-    Now we explicitly forward `suite` and `camels_data` (i.e. 'WDM') into data.CAMELS.
-    """
+    batch_size: int,
+    num_workers: int,
+    idx_train: range,
+    idx_val: range,
+    map_type: str,
+    parameters: list[str],
+    suite: str,
+    dataset: str,
+    root: str,
+) -> tuple[DataLoader, DataLoader, int, int]:
+    """Build training and validation DataLoaders for CAMELS data."""
     print(f"Using {len(idx_train)} training points and {len(idx_val)} validation points.")
     train_data = data.CAMELS(
-        root = root,
+        root=root,
         idx_list=idx_train,
-        map_type=map_type,         # e.g. 'Mcdm' or 'WDM'
-        parameters=parameters,     # e.g. ['Omega_m', 'sigma_8']
-        suite=suite,               # e.g. 'IllustrisTNG'
-        dataset=camels_data,          # e.g. 'WDM'
+        map_type=map_type,
+        parameters=parameters,
+        suite=suite,
+        dataset=dataset,
     )
     val_data = data.CAMELS(
         root=root,
@@ -47,34 +77,24 @@ def get_camels_dataloaders(
         map_type=map_type,
         parameters=parameters,
         suite=suite,
-        dataset=camels_data,
+        dataset=dataset,
     )
     train_loader = DataLoader(
-        train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+        train_data, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
-        val_data,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        val_data, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
     return train_loader, val_loader, len(train_data), len(val_data)
 
 
-def train(args):
-    # ------------------------
-    # 1) Set random seeds
-    # ------------------------
-    seed_everything(137, workers=True)
+def train(args: TrainConfig) -> None:
+    """Main training loop."""
+    seed_everything(args.seed, workers=True)
 
-    # ------------------------
-    # 2) (Optional) initialize WandB
-    # ------------------------
+    # Logger
     logger = None
     if args.use_wandb:
         logger = WandbLogger(
@@ -86,44 +106,44 @@ def train(args):
     else:
         print("🔸 Running without Weights & Biases logger.")
 
-
+    # Data splits
     train_end = args.train_size
     val_end = args.train_size + args.val_size
     idx_train = range(train_end)
     idx_val = range(train_end, val_end)
-    
-    # Now forward suite and data into our loader util:
+
     train_loader, val_loader, n_train, n_val = get_camels_dataloaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         idx_train=idx_train,
         idx_val=idx_val,
-        map_type="Mcdm",                # you could also switch this to "WDM" if that’s what you want
+        map_type="Mcdm",
         parameters=["Omega_m", "sigma_8"],
         suite=args.camels_suite,
-        camels_data=args.camels_data,
+        dataset=args.camels_data,
         root=args.root,
     )
 
     print(
-        f"Using {n_train} training samples and {n_val} validation samples (suite={getattr(args, 'camels_suite', 'N/A')}, data={getattr(args, 'camels_data', 'N/A')})."
+        f"Using {n_train} training samples and {n_val} validation samples "
+        f"(suite={args.camels_suite}, data={args.camels_data})."
     )
 
     fm = represent.CosmoFlow(
         log_wandb=args.use_wandb,
         latent_img_channels=args.latent_img_channels,
+        use_temporal_masking=not args.no_temporal_masking,
+        conditioned_attention=args.conditioned_attention,
     )
 
-    def init_weights(m):
+    def init_weights(m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, a=0, mode="fan_in", nonlinearity="relu")
             m.bias.data.fill_(0.01)
-    
-    fm.apply(init_weights)
-    fm.train()
 
-    # Checkpoints: keep the best on val_loss and always save last,
-    # saving every N training steps (so you can resume if you crash)
+    fm.apply(init_weights)
+
+    # Checkpoints
     checkpoint_callback = ModelCheckpoint(
         dirpath=Path(args.output_dir) / f"{args.run_name}",
         filename="step={step}-val_loss={val_loss:.3f}",
@@ -134,9 +154,7 @@ def train(args):
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    # ------------------------
-    # 5) Trainer
-    # ------------------------
+    # Trainer
     trainer = Trainer(
         max_steps=args.max_steps,
         gradient_clip_val=args.grad_clip,
@@ -152,9 +170,6 @@ def train(args):
         accelerator="gpu",
     )
 
-    # ------------------------
-    # 6) Start (fine‐)tuning
-    # ------------------------
     trainer.fit(
         model=fm,
         train_dataloaders=train_loader,
@@ -162,66 +177,66 @@ def train(args):
     )
 
 
-if __name__ == "__main__":
-    parser = ArgumentParser()
+def parse_args() -> TrainConfig:
+    """Parse command line arguments into TrainConfig."""
+    parser = ArgumentParser(description="Train CosmoFlow compression model.")
 
-    # output + logging
-    parser.add_argument(
-        "--output_dir", default="", help="output directory for checkpoints etc."
-    )
-    parser.add_argument("--root", type=str, required=True, help="dataset directory")
-    parser.add_argument(
-        "--run_name",
-        default="finetuning",
-        type=str,
-        help="WandB run name (if using wandb).",
-    )
+    # Output + logging
+    out_grp = parser.add_argument_group("Output & Logging")
+    out_grp.add_argument("--output_dir", default="", help="Output directory for checkpoints.")
+    out_grp.add_argument("--root", type=str, required=True, help="Dataset directory.")
+    out_grp.add_argument("--run_name", default="finetuning", type=str, help="WandB run name.")
+    out_grp.add_argument("--use_wandb", action="store_true", default=False)
+    
+    # CAMELS-specific
+    data_grp = parser.add_argument_group("Data Settings")
+    data_grp.add_argument("--camels_suite", type=str, default="Astrid", help="CAMELS suite (e.g. IllustrisTNG).")
+    data_grp.add_argument("--camels_data", type=str, default="LH", help="CAMELS data/map type (e.g. WDM).")
+    data_grp.add_argument("--train_size", type=int, required=True, help="Number of training samples.")
+    data_grp.add_argument("--val_size", type=int, required=True, help="Number of validation samples.")
 
-    # ── CAMELS‐specific arguments ────────────────────────────
-    parser.add_argument(
-        "--camels_suite",
-        type=str,
-        default="Astrid",
-        help="Which CAMELS suite to use (e.g. IllustrisTNG, SIMBA, etc.)",
-    )
-    parser.add_argument(
-        "--camels_data",
-        type=str,
-        default="LH",
-        help="Which CAMELS data/map type to load (e.g. WDM, Mcdm, etc.)",
-    )
+    # Optimisation
+    opt_grp = parser.add_argument_group("Optimization")
+    opt_grp.add_argument("--learning_rate", default=5e-5, type=float)
+    opt_grp.add_argument("--grad_clip", default=1.0, type=float)
+    opt_grp.add_argument("--batch_size", default=16, type=int)
+    opt_grp.add_argument("--accumulate_gradients", default=None, type=int)
+    opt_grp.add_argument("--num_workers", default=4, type=int)
+    opt_grp.add_argument("--latent_dim", default=256, type=int)
+    opt_grp.add_argument("--latent_img_channels", type=int, default=8)
 
-    # ── Optimization hyperparameters ────────────────────────
-    parser.add_argument("--learning_rate", default=5e-5, type=float)
-    parser.add_argument("--grad_clip", default=1.0, type=float)
-    parser.add_argument("--batch_size", default=8, type=int)
-    parser.add_argument("--accumulate_gradients", default=None, type=int)
-    parser.add_argument("--num_workers", default=4, type=int)
-    parser.add_argument("--save_every", default=50, type=int)
-    parser.add_argument("--eval_every", default=50, type=int)
-    parser.add_argument("--latent_dim", default=256, type=int)
-    parser.add_argument("--latent_img_channels", type=int, default=16)
-
-    # ── Data subset sizes (for small‐scale fine‐tuning) ───────
-    parser.add_argument(
-        "--train_size",
+    # Trainer settings
+    train_grp = parser.add_argument_group("Trainer Config")
+    train_grp.add_argument("--max_steps", default=2_000_000, type=int)
+    train_grp.add_argument("--max_epochs", default=100, type=int)
+    train_grp.add_argument("--save_every", default=50, type=int)
+    train_grp.add_argument("--eval_every", default=50, type=int)
+    train_grp.add_argument("--profile", action="store_true", default=False)
+    train_grp.add_argument("--gpus", type=int, default=3, help="How many GPUs to use.")
+    train_grp.add_argument(
+        "--no-temporal-masking",
+        action="store_true",
+        default=False,
+        help="Disable time-dependent channel masking on encoder output.",
+    )
+    train_grp.add_argument(
+        "--conditioned-attention",
+        action="store_true",
+        default=False,
+        help="Use AdaLN-Zero timestep-conditioned self-attention instead of vanilla.",
+    )
+    train_grp.add_argument(
+        "--seed",
         type=int,
-        required=True,
-        help="Number of training samples to use (e.g. 500 for quick fine‐tuning).",
+        default=12,
+        help="Global random seed passed to seed_everything().",
     )
-    parser.add_argument(
-        "--val_size",
-        type=int,
-        required=True,
-        help="Number of validation samples to use.",
-    )
-
-    # ── Trainer settings ────────────────────────────────────
-    parser.add_argument("--max_steps", default=2_000, type=int)
-    parser.add_argument("--max_epochs", default=100, type=int)
-    parser.add_argument("--profile", action="store_true", default=False)
-    parser.add_argument("--gpus", type=int, default=3, help="How many GPUs to use")
-    parser.add_argument("--use_wandb", action="store_true", default=False)
 
     args = parser.parse_args()
-    train(args)
+    return TrainConfig(**vars(args))
+
+
+if __name__ == "__main__":
+    config = parse_args()
+    train(config)
+

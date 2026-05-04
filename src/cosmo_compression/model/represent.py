@@ -1,19 +1,24 @@
-from typing import Any, Dict, Tuple
-from io import BytesIO
+"""CosmoFlow – LightningModule for flow-matching based cosmological field compression."""
 
-import torch
-from torch import nn
-from PIL import Image
+from __future__ import annotations
+
+from io import BytesIO
+from typing import Any
+
 import matplotlib.pyplot as plt
+import torch
 import wandb
-from lightning.pytorch import utilities
 from lightning import LightningModule
+from lightning.pytorch import utilities
+from PIL import Image
+from torch import nn
 
 from cosmo_compression.model import flow_matching as fm
-from cosmo_compression.model import resnet, unet
+from cosmo_compression.model import resnet, unet, dit
+
 
 def log_matplotlib_figure(figure_label: str) -> None:
-    """Log a matplotlib figure to WandB without converting to Plotly."""
+    """Log the current matplotlib figure to WandB as a PNG image."""
     buf = BytesIO()
     plt.savefig(buf, format="png", dpi=300)
     buf.seek(0)
@@ -21,15 +26,27 @@ def log_matplotlib_figure(figure_label: str) -> None:
     wandb.log({figure_label: wandb.Image(image)})
     buf.close()
 
+
 class CosmoFlow(LightningModule):
-    """LightningModule for flow‑matching based cosmological field compression."""
+    """LightningModule for flow-matching based cosmological field compression.
+
+    Args:
+        unconditional: If True, skip encoding and run unconditional generation.
+        log_wandb: Whether to log figures to Weights & Biases.
+        latent_img_channels: Number of spatial channels in the encoder output.
+        use_temporal_masking: If True, apply time-dependent channel masking to
+            the encoder output inside the UNet. Set to False to disable.
+    """
 
     def __init__(
         self,
         unconditional: bool = False,
         log_wandb: bool = True,
-        reverse: bool = False,
         latent_img_channels: int = 64,
+        use_temporal_masking: bool = True,
+        unet_channel_mults: tuple[int, int, int, int, int] = (64, 128, 256, 512, 512),
+        conditioned_attention: bool = False,
+        # use_dit_backbone: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -37,12 +54,16 @@ class CosmoFlow(LightningModule):
         self.unconditional = unconditional
         self.log_wandb = log_wandb
         self.latent_img_channels = latent_img_channels
+        self.use_temporal_masking = use_temporal_masking
+        self.unet_channel_mults = unet_channel_mults
+        self.conditioned_attention = conditioned_attention
 
         self.encoder = self._init_encoder(in_channels=1)
         velocity_model = self._init_velocity()
-        self.decoder = fm.FlowMatching(velocity_model, reverse=reverse)
+        self.decoder = fm.FlowMatching(velocity_model)
 
-        self.validation_step_outputs: list[Dict[str, Any]] = []
+        self.validation_step_outputs: list[dict[str, Any]] = []
+        # self.use_dit_backbone = use_dit_backbone
 
     def _init_encoder(self, in_channels: int) -> nn.Module:
         return resnet.ResNetEncoder(
@@ -51,15 +72,31 @@ class CosmoFlow(LightningModule):
         )
 
     def _init_velocity(self) -> nn.Module:
+        # if self.use_dit_backbone: 
+        #     return dit.DiT(
+        #         input_channels=1,
+        #         depth=4,
+        #         mlp_ratio=2,
+        #         n_heads=4,
+        #         qkv_bias=True,
+        #         latent_img_channels=self.latent_img_channels
+        #     )
         return unet.UNet(
             n_channels=1,
             time_dim=256,
             latent_img_channels=self.latent_img_channels,
+            use_temporal_masking=self.use_temporal_masking,
+            channel_mults=self.unet_channel_mults,
+            conditioned_attention=self.conditioned_attention,
         )
+
+    # def configure_model(self):
+    #     self.encoder = torch.compile(self.encoder, mode="reduce-overhead")
+    #     self.decoder = torch.compile(self.decoder, mode="reduce-overhead")
 
     def get_loss(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         y, _ = batch
         t = torch.rand((y.shape[0],), device=y.device)
@@ -69,18 +106,16 @@ class CosmoFlow(LightningModule):
 
     def training_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
-        *args,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        *args: Any,
     ) -> torch.Tensor:
-        # Note: optimizer.step() is intentionally called here
-        self.optimizers().step()
         loss = self.get_loss(batch)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         loss = self.get_loss(batch)
         self.validation_step_outputs.append({"val_loss": loss, "batch": batch})
@@ -95,12 +130,11 @@ class CosmoFlow(LightningModule):
             self._log_figures(batch)
 
         self.validation_step_outputs.clear()
-        self.optimizers().step()
 
     @utilities.rank_zero_only
     def _log_figures(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
         y, _ = batch
         y = y[0:1]
@@ -119,10 +153,10 @@ class CosmoFlow(LightningModule):
         log_matplotlib_figure("field_reconstruction")
         plt.close(fig)
 
-    def configure_optimizers(self) -> Dict[str, Any]:
-        optimizer = torch.optim.AdamW(self.parameters(), lr=5e-5)
+    def configure_optimizers(self) -> dict[str, Any]:
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, factor=0.5, patience=10, min_lr=1e-8
+            optimizer, factor=0.5, patience=10, min_lr=1e-8,
         )
         return {
             "optimizer": optimizer,
