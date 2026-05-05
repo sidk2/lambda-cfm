@@ -56,11 +56,12 @@ class SelfAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        size = x.shape[-1]
-        x = x.view(-1, self.channels, size * size).swapaxes(1, 2)
-        x, _ = self.mha(x, x, x)
-        x = self.ff_self(x) + x
-        return x.swapaxes(2, 1).view(-1, self.channels, size, size)
+        B, C, H, W = x.shape
+        x_seq = x.view(B, self.channels, H * W).swapaxes(1, 2)
+        attn_out, _ = self.mha(x_seq, x_seq, x_seq)
+        x_seq = x_seq + attn_out
+        x_seq = self.ff_self(x_seq) + x_seq
+        return x_seq.swapaxes(2, 1).view(B, self.channels, H, W)
 
 
 def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
@@ -303,6 +304,33 @@ class UpStepWoutRes(nn.Module):
         return x
 
 
+class DepthwiseUpStep(nn.Module):
+    """Upsample spatial resolution by 2x while strictly preserving channel independence."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        # Depthwise convolution: groups=channels
+        self.conv = nn.Conv2d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=False,
+            padding_mode="circular",
+        )
+        # InstanceNorm equivalent
+        self.norm = nn.GroupNorm(num_groups=channels, num_channels=channels)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.upsample(x)
+        x = self.conv(x)
+        x = self.norm(x)
+        return self.act(x)
+
+
 class UNet(nn.Module):
     """Conditional UNet for velocity-field prediction in flow matching.
 
@@ -363,11 +391,7 @@ class UNet(nn.Module):
         self.outc = nn.Conv2d(in_channels=c0, out_channels=n_channels, kernel_size=1, stride=1, padding=0, bias=True)
 
         self.latent_upsampler = nn.Sequential(*[
-            UpStepWoutRes(
-                in_channels=self.num_latent_channels, 
-                out_channels=self.num_latent_channels, 
-                time_dim=time_dim,
-            )
+            DepthwiseUpStep(channels=self.num_latent_channels)
             for _ in range(latent_upsample_steps)
         ])
 
@@ -378,6 +402,7 @@ class UNet(nn.Module):
     def pos_encoding(self, t: torch.Tensor, channels: int) -> torch.Tensor:
         """Generate sinusoidal timestep embedding."""
         device = t.device
+        t = t * 1000.0
         inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2, device=device).float() / channels))
         pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
         pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)
