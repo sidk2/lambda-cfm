@@ -12,6 +12,7 @@ from lightning import LightningModule
 from cosmo_compression.model import flow_matching as fm
 from cosmo_compression.model import resnet, unet
 
+
 def log_matplotlib_figure(figure_label: str) -> None:
     """Log a matplotlib figure to WandB without converting to Plotly."""
     buf = BytesIO()
@@ -20,6 +21,7 @@ def log_matplotlib_figure(figure_label: str) -> None:
     image = Image.open(buf)
     wandb.log({figure_label: wandb.Image(image)})
     buf.close()
+
 
 class CosmoFlow(LightningModule):
     """LightningModule for flow‑matching based cosmological field compression."""
@@ -30,6 +32,7 @@ class CosmoFlow(LightningModule):
         log_wandb: bool = True,
         reverse: bool = False,
         latent_img_channels: int = 64,
+        use_temporal_masking: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -37,6 +40,7 @@ class CosmoFlow(LightningModule):
         self.unconditional = unconditional
         self.log_wandb = log_wandb
         self.latent_img_channels = latent_img_channels
+        self.use_temporal_masking = use_temporal_masking
 
         self.encoder = self._init_encoder(in_channels=1)
         velocity_model = self._init_velocity()
@@ -55,6 +59,7 @@ class CosmoFlow(LightningModule):
             n_channels=1,
             time_dim=256,
             latent_img_channels=self.latent_img_channels,
+            use_temporal_masking=self.use_temporal_masking,
         )
 
     def get_loss(

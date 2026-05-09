@@ -18,6 +18,9 @@ from cosmo_compression.data import data
 torch.cuda.empty_cache()
 torch.set_float32_matmul_precision('medium')
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
+
 def get_camels_dataloaders(
     batch_size,
     num_workers,
@@ -70,7 +73,7 @@ def train(args):
     # ------------------------
     # 1) Set random seeds
     # ------------------------
-    seed_everything(137, workers=True)
+    seed_everything(args.random_seed, workers=True)
 
     # ------------------------
     # 2) (Optional) initialize WandB
@@ -112,6 +115,7 @@ def train(args):
     fm = represent.CosmoFlow(
         log_wandb=args.use_wandb,
         latent_img_channels=args.latent_img_channels,
+        use_temporal_masking=not args.disable_temporal_masking,
     )
 
     def init_weights(m):
@@ -194,13 +198,13 @@ if __name__ == "__main__":
     # ── Optimization hyperparameters ────────────────────────
     parser.add_argument("--learning_rate", default=5e-5, type=float)
     parser.add_argument("--grad_clip", default=1.0, type=float)
-    parser.add_argument("--batch_size", default=8, type=int)
+    parser.add_argument("--batch_size", default=20, type=int)
     parser.add_argument("--accumulate_gradients", default=None, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--save_every", default=50, type=int)
     parser.add_argument("--eval_every", default=50, type=int)
     parser.add_argument("--latent_dim", default=256, type=int)
-    parser.add_argument("--latent_img_channels", type=int, default=16)
+    parser.add_argument("--latent_img_channels", type=int, default=8)
 
     # ── Data subset sizes (for small‐scale fine‐tuning) ───────
     parser.add_argument(
@@ -217,11 +221,13 @@ if __name__ == "__main__":
     )
 
     # ── Trainer settings ────────────────────────────────────
-    parser.add_argument("--max_steps", default=2_000, type=int)
+    parser.add_argument("--max_steps", default=3_000_000, type=int)
     parser.add_argument("--max_epochs", default=100, type=int)
     parser.add_argument("--profile", action="store_true", default=False)
-    parser.add_argument("--gpus", type=int, default=3, help="How many GPUs to use")
+    parser.add_argument("--gpus", type=int, default=4, help="How many GPUs to use")
     parser.add_argument("--use_wandb", action="store_true", default=False)
+    parser.add_argument("--disable_temporal_masking", action="store_true", default=False, help="Turn off temporal masking")
+    parser.add_argument("--random-seed", type=int, default=137, help="Random seed for reproducibility")
 
     args = parser.parse_args()
     train(args)

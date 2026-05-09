@@ -73,6 +73,7 @@ class SelfAttention(nn.Module):
         x = self.ff_self(x) + x
         return x.swapaxes(2, 1).view(-1, self.channels, size, size)
 
+
 def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
     """3x3 sub-pixel convolution for up-sampling."""
     return nn.Sequential(
@@ -96,6 +97,17 @@ class UpsamplingUNetConv(nn.Module):
         self.residual = residual
         if not int_channels:
             int_channels = out_channels
+
+        self.shortcut = None
+        if self.residual:
+            if in_channels != out_channels:
+                self.shortcut = nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                )
+            else:
+                self.shortcut = nn.Upsample(scale_factor=2, mode="nearest")
+
         self.conv1 = nn.Conv2d(
             in_channels=in_channels, out_channels=int_channels, kernel_size=3, padding=1
         )
@@ -126,6 +138,8 @@ class UpsamplingUNetConv(nn.Module):
         """Overloads forward method of nn.Module"""
         # t is shape [batch_size]
 
+        identity = x
+
         t_s1 = self.t_scale_proj_1(t) if t is not None else None
         t_b1 = self.t_bias_proj_1(t) if t is not None else None
 
@@ -138,14 +152,16 @@ class UpsamplingUNetConv(nn.Module):
         z_s2 = self.z_scale_proj_2(z) if z is not None else None
         z_b2 = self.z_bias_proj_2(z) if z is not None else None
 
-        x = self.conv1(x)
-        x = self.gn_1(x, t_s1, t_b1, z_s1, z_b1)
-        x = self.gelu(x)
-        x = self.conv2(x)
-        x = self.gn_2(x, t_s2, t_b2, z_s2, z_b2)
-        x = x + self.gelu(x)
+        out = self.conv1(x)
+        out = self.gn_1(out, t_s1, t_b1, z_s1, z_b1)
+        out = self.gelu(out)
+        out = self.conv2(out)
+        out = self.gn_2(out, t_s2, t_b2, z_s2, z_b2)
+        
+        if self.residual:
+            out = out + self.shortcut(identity)
 
-        return x
+        return out
 
 
 class UNetConv(nn.Module):
@@ -164,6 +180,20 @@ class UNetConv(nn.Module):
         self.residual = residual
         if not int_channels:
             int_channels = out_channels
+
+        self.shortcut = None
+        if self.residual:
+            if in_channels != out_channels:
+                self.shortcut = nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    bias=False,
+                    padding_mode="circular",
+                )
+            else:
+                self.shortcut = nn.Identity()
+
         self.conv1 = nn.Conv2d(
             in_channels,
             int_channels,
@@ -211,6 +241,8 @@ class UNetConv(nn.Module):
         """Overloads forward method of nn.Module"""
         # t is shape [batch_size]
 
+        identity = x
+
         t_s1 = self.t_scale_proj_1(t) if t is not None else None
         t_b1 = self.t_bias_proj_1(t) if t is not None else None
 
@@ -223,14 +255,16 @@ class UNetConv(nn.Module):
         z_s2 = self.z_scale_proj_2(z) if z is not None else None
         z_b2 = self.z_bias_proj_2(z) if z is not None else None
 
-        x = self.conv1(x)
-        x = self.gn_1(x, t_s1, t_b1, z_s1, z_b1)
-        x = self.gelu(x)
-        x = self.conv2(x)
-        x = self.gn_2(x, t_s2, t_b2, z_s2, z_b2)
-        x = x + self.gelu(x)
+        out = self.conv1(x)
+        out = self.gn_1(out, t_s1, t_b1, z_s1, z_b1)
+        out = self.gelu(out)
+        out = self.conv2(out)
+        out = self.gn_2(out, t_s2, t_b2, z_s2, z_b2)
+        
+        if self.residual:
+            out = out + self.shortcut(identity)
 
-        return x
+        return out
 
 
 class DownStep(nn.Module):
@@ -264,7 +298,7 @@ class DownStep(nn.Module):
         )
         self.gdn_layer = gdn.GDN(ch=out_channels, device="cuda")
 
-    def forward(self, x: torch.Tensor, t, z = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t, z=None) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
         return self.gdn_layer(self.conv2(self.conv1(self.pooling(x), t, z), t, z))
 
@@ -296,7 +330,7 @@ class UpStep(nn.Module):
 
         self.gdn_layer = gdn.GDN(ch=out_channels, device="cuda", inverse=True)
 
-    def forward(self, x: torch.Tensor, res_x: torch.Tensor, t, z = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, res_x: torch.Tensor, t, z=None) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
         x = self.conv1(x, t, z)
         x = torch.cat([res_x, x], dim=1)
@@ -345,11 +379,13 @@ class UNet(nn.Module):
         time_dim: int = 256,
         latent_img_channels: int = 32,
         latent_vec_dim: int = 14 * 9,
+        use_temporal_masking: bool = True,
     ):
         super(UNet, self).__init__()
         self.time_dim = time_dim
         self.n_channels = n_channels
         self.num_latent_channels = latent_img_channels
+        self.use_temporal_masking = use_temporal_masking
 
         self.dropout = nn.Dropout2d(p=0.1)
         self.inc = UNetConv(
@@ -358,55 +394,39 @@ class UNet(nn.Module):
             time_dim=time_dim,
             residual=True,
         )
-        self.down1 = DownStep(
-            in_channels=64 + self.num_latent_channels,
-            out_channels=128,
-            time_dim=time_dim,
-        )
-        self.down2 = DownStep(
-            in_channels=128 ,
-            out_channels=256,
-            time_dim=time_dim,
-        )
-        self.sa2 = SelfAttention(channels=256)
-        self.down3 = DownStep(
-            in_channels=256 ,
-            out_channels=512,
-            time_dim=time_dim,
-        )
-        self.sa3 = SelfAttention(channels=512)
-        self.down4 = DownStep(
-            in_channels=512 ,
-            out_channels=512,
-            time_dim=time_dim,
-        )
+        # Downsampling stages
+        down_channels = [64 + self.num_latent_channels, 128, 256, 512, 512]
+        self.downs = nn.ModuleList()
+        for i in range(len(down_channels) - 1):
+            self.downs.append(
+                DownStep(
+                    in_channels=down_channels[i],
+                    out_channels=down_channels[i + 1],
+                    time_dim=time_dim,
+                )
+            )
+            # Add self-attention after out_channels=256 and out_channels=512 (first instance)
+            if down_channels[i + 1] in [256, 512] and i < len(down_channels) - 2:
+                self.downs.append(SelfAttention(channels=down_channels[i + 1]))
 
-        self.up0 = UpStep(
-            in_channels=512,
-            res_channels=512 ,
-            out_channels=256,
-            time_dim=time_dim,
-        )
-        self.sa0_inv = SelfAttention(channels=256)
-        self.up1 = UpStep(
-            in_channels=256,
-            res_channels=256 ,
-            out_channels=256,
-            time_dim=time_dim,
-        )
-        self.sa1_inv = SelfAttention(channels=256)
-        self.up2 = UpStep(
-            in_channels=256,
-            res_channels=128 ,
-            out_channels=128,
-            time_dim=time_dim,
-        )
-        self.up3 = UpStep(
-            in_channels=128,
-            res_channels=64 + self.num_latent_channels,
-            out_channels=64,
-            time_dim=time_dim,
-        )
+        # Upsampling stages
+        up_in_ch = [512, 256, 256, 128]
+        up_res_ch = [512, 256, 128, 64 + self.num_latent_channels]
+        up_out_ch = [256, 256, 128, 64]
+        
+        self.ups = nn.ModuleList()
+        for i in range(len(up_in_ch)):
+            self.ups.append(
+                UpStep(
+                    in_channels=up_in_ch[i],
+                    res_channels=up_res_ch[i],
+                    out_channels=up_out_ch[i],
+                    time_dim=time_dim,
+                )
+            )
+            # Add self-attention after up0 and up1
+            if i in [0, 1]:
+                self.ups.append(SelfAttention(channels=up_out_ch[i]))
 
         self.outc = nn.Conv2d(
             in_channels=64,
@@ -417,26 +437,14 @@ class UNet(nn.Module):
             bias=True,
         )
         self.latent_upsampler_0 = nn.Sequential(
-            UpStepWoutRes(
-                in_channels=int(self.num_latent_channels),
-                out_channels=int(self.num_latent_channels ),
-                time_dim=time_dim,
-            ),
-            UpStepWoutRes(
-                in_channels=int(self.num_latent_channels ),
-                out_channels=int(self.num_latent_channels ),
-                time_dim=time_dim,
-            ),
-            UpStepWoutRes(
-                in_channels=int(self.num_latent_channels ),
-                out_channels=int(self.num_latent_channels ),
-                time_dim=time_dim,
-            ),
-            UpStepWoutRes(
-                in_channels=int(self.num_latent_channels ),
-                out_channels=int(self.num_latent_channels ),
-                time_dim=time_dim,
-            ),
+            *[
+                UpStepWoutRes(
+                    in_channels=int(self.num_latent_channels),
+                    out_channels=int(self.num_latent_channels),
+                    time_dim=time_dim,
+                )
+                for _ in range(4)
+            ]
         )
 
         self.latent_vec_dim = latent_vec_dim
@@ -475,19 +483,17 @@ class UNet(nn.Module):
         if t.shape[0] != B:
             t = t.expand(B, t.shape[0])
 
-        start = 0
-        end = C
-                
-        for b in range(B):
-            t_val = float(t[b])
-            num_mask = int(C * t_val)
-            unmasked = C - num_mask
+        if self.use_temporal_masking:
+            for b in range(B):
+                t_val = float(t[b])
+                num_mask = int(C * t_val)
+                unmasked = C - num_mask
 
-            # index of the last channel we want to keep gradients on
-            last_unmasked = unmasked - 1
-            # zero-out everything *after* last_unmasked
-            if num_mask > 0:
-                spatial[b, last_unmasked+1 :, ...] = 0
+                # index of the last channel we want to keep gradients on
+                last_unmasked = unmasked - 1
+                # zero-out everything *after* last_unmasked
+                if num_mask > 0:
+                    spatial[b, last_unmasked + 1 :, ...] = 0
 
         # --- End of masking ---
 
@@ -501,39 +507,29 @@ class UNet(nn.Module):
         x1 = self.inc(x, t, vec_latent)
         x1 = torch.cat(
             [
-                self.latent_upsampler_0(
-                    spatial
-                ),
+                self.latent_upsampler_0(spatial),
                 x1,
             ],
             dim=1,
         )
-        x2 = self.down1(x1, t)
-        x3 = self.down2(
-            x2, t
-        )
-        x3 = self.sa2(x3)
-        x4 = self.down3(
-            x3, t
-        )
-        x4 = self.sa3(x4)
-        x5 = self.down4(
-            x4, t
-        )
+        skips = [x1]
+        x_stage = x1
+        
+        for layer in self.downs:
+            if isinstance(layer, DownStep):
+                x_stage = layer(x_stage, t)
+                skips.append(x_stage)
+            elif isinstance(layer, SelfAttention):
+                x_stage = layer(x_stage)
+                skips[-1] = x_stage
 
         # Upsampling stages
-        x = self.up0(
-            x5, x4, t
-        )
-        x = self.up1(
-            x, x3, t
-        )
-        x = self.sa1_inv(x)
-        x = self.up2(
-            x, x2, t
-        )
-        x = self.up3(
-            x, x1, t
-        )
+        x_stage = skips.pop()  # This gets x5
+        for layer in self.ups:
+            if isinstance(layer, UpStep):
+                skip_x = skips.pop()
+                x_stage = layer(x_stage, skip_x, t)
+            elif isinstance(layer, SelfAttention):
+                x_stage = layer(x_stage)
 
-        return self.outc(x)
+        return self.outc(x_stage)
