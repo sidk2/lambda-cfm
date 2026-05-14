@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from cosmo_compression.model import gdn
 
@@ -40,7 +41,6 @@ class AdaGN(nn.Module):
             return self.gn(x)
         elif z_s is None or z_b is None:
             return t_s[:, :, None, None] * self.gn(x) + t_b[:, :, None, None]
-
         else:
             return (
                 z_s[:, :, None, None]
@@ -49,16 +49,49 @@ class AdaGN(nn.Module):
             )
 
 
+class ConditioningProj(nn.Module):
+    """Projects timestep and latent embeddings into scale/bias for one conv layer."""
+
+    def __init__(self, time_dim: int, latent_dim: int, out_channels: int, use_z_cond: bool = True):
+        super().__init__()
+        self.use_z_cond = use_z_cond
+        self.t_scale = nn.Linear(time_dim, out_channels)
+        self.t_bias  = nn.Linear(time_dim, out_channels)
+        if use_z_cond:
+            self.z_scale = nn.Linear(latent_dim, out_channels)
+            self.z_bias  = nn.Linear(latent_dim, out_channels)
+
+    def forward(
+        self,
+        t: torch.Tensor | None,
+        z: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        t_s = self.t_scale(t) if t is not None else None
+        t_b = self.t_bias(t)  if t is not None else None
+        if self.use_z_cond:
+            z_s = self.z_scale(z) if z is not None else None
+            z_b = self.z_bias(z)  if z is not None else None
+        else:
+            z_s = z_b = None
+        return t_s, t_b, z_s, z_b
+
+
 class SelfAttention(nn.Module):
-    """Implementation of a self-attention module"""
+    """Self-attention using scaled_dot_product_attention (Flash Attention on supported hardware)."""
 
     def __init__(self, channels: int):
-        super(SelfAttention, self).__init__()
+        super().__init__()
         self.channels = channels
-        self.mha = nn.MultiheadAttention(channels, 1, batch_first=True)
-        self.ln = nn.LayerNorm([channels])
+        self.ln = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, 3 * channels, bias=False)
+        self.proj = nn.Linear(channels, channels)
         self.ff_self = nn.Sequential(
-            nn.LayerNorm([channels]),
+            nn.LayerNorm(channels),
             nn.Linear(channels, channels),
             nn.GELU(),
             nn.Linear(channels, channels),
@@ -66,12 +99,18 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Overloads forward pass of nn.Module"""
-        size = x.shape[-1]
-        x = x.view(-1, self.channels, size * size).swapaxes(1, 2)
-        x, _ = self.mha(x, x, x)
-        # attention_value = attention_value + x
-        x = self.ff_self(x) + x
-        return x.swapaxes(2, 1).view(-1, self.channels, size, size)
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, H * W).transpose(1, 2)  # [B, N, C]
+
+        # Pre-norm + QKV; add head dim for SDPA: [B, 1, N, C]
+        q, k, v = self.qkv(self.ln(x_flat)).chunk(3, dim=-1)
+        q, k, v = q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+
+        # Dispatches to Flash Attention / memory-efficient attn as available
+        attn = F.scaled_dot_product_attention(q, k, v).squeeze(1)  # [B, N, C]
+        x_flat = self.proj(attn)
+        x_flat = self.ff_self(x_flat) + x_flat
+        return x_flat.transpose(1, 2).view(B, C, H, W)
 
 
 def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
@@ -82,7 +121,7 @@ def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
 
 
 class UpsamplingUNetConv(nn.Module):
-    """2 sets of convolution plus batch norm. Basic UNet building block."""
+    """2 sets of convolution plus AdaGN. Upsampling UNet building block."""
 
     def __init__(
         self,
@@ -92,6 +131,7 @@ class UpsamplingUNetConv(nn.Module):
         residual: bool = False,
         time_dim: int = 256,
         latent_vec_dim: int = 14,
+        use_z_cond: bool = True,
     ):
         super().__init__()
         self.residual = residual
@@ -111,53 +151,27 @@ class UpsamplingUNetConv(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels=in_channels, out_channels=int_channels, kernel_size=3, padding=1
         )
-        self.gn_1 = AdaGN(
-            num_channels=int_channels,
-            num_groups=compute_groups(int_channels),
-        )
+        self.gn_1 = AdaGN(num_channels=int_channels, num_groups=compute_groups(int_channels))
         self.gelu = nn.GELU()
         self.conv2 = subpel_conv3x3(in_ch=int_channels, out_ch=out_channels, r=2)
-        self.gn_2 = AdaGN(
-            num_channels=out_channels,
-            num_groups=compute_groups(out_channels),
-        )
+        self.gn_2 = AdaGN(num_channels=out_channels, num_groups=compute_groups(out_channels))
 
-        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels)
-
-        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels)
-        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels)
-
-        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-
-        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels)
-        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels)
+        self.cond1 = ConditioningProj(time_dim, latent_vec_dim, int_channels, use_z_cond)
+        self.cond2 = ConditioningProj(time_dim, latent_vec_dim, out_channels, use_z_cond)
 
     def forward(self, x: torch.Tensor, t=None, z=None) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
-        # t is shape [batch_size]
-
         identity = x
 
-        t_s1 = self.t_scale_proj_1(t) if t is not None else None
-        t_b1 = self.t_bias_proj_1(t) if t is not None else None
-
-        t_s2 = self.t_scale_proj_2(t) if t is not None else None
-        t_b2 = self.t_bias_proj_2(t) if t is not None else None
-
-        z_s1 = self.z_scale_proj_1(z) if z is not None else None
-        z_b1 = self.z_bias_proj_1(z) if z is not None else None
-
-        z_s2 = self.z_scale_proj_2(z) if z is not None else None
-        z_b2 = self.z_bias_proj_2(z) if z is not None else None
+        t_s1, t_b1, z_s1, z_b1 = self.cond1(t, z)
+        t_s2, t_b2, z_s2, z_b2 = self.cond2(t, z)
 
         out = self.conv1(x)
         out = self.gn_1(out, t_s1, t_b1, z_s1, z_b1)
         out = self.gelu(out)
         out = self.conv2(out)
         out = self.gn_2(out, t_s2, t_b2, z_s2, z_b2)
-        
+
         if self.residual:
             out = out + self.shortcut(identity)
 
@@ -165,7 +179,7 @@ class UpsamplingUNetConv(nn.Module):
 
 
 class UNetConv(nn.Module):
-    """2 sets of convolution plus batch norm. Basic UNet building block."""
+    """2 sets of convolution plus AdaGN. Basic UNet building block."""
 
     def __init__(
         self,
@@ -175,6 +189,7 @@ class UNetConv(nn.Module):
         int_channels: int | None = None,
         residual: bool = False,
         latent_vec_dim: int = 14 * 9,
+        use_z_cond: bool = True,
     ):
         super().__init__()
         self.residual = residual
@@ -202,10 +217,7 @@ class UNetConv(nn.Module):
             bias=False,
             padding_mode="circular",
         )
-        self.gn_1 = AdaGN(
-            num_channels=int_channels,
-            num_groups=compute_groups(int_channels),
-        )
+        self.gn_1 = AdaGN(num_channels=int_channels, num_groups=compute_groups(int_channels))
         self.gelu = nn.GELU()
         self.conv2 = nn.Conv2d(
             int_channels,
@@ -215,22 +227,10 @@ class UNetConv(nn.Module):
             bias=False,
             padding_mode="circular",
         )
-        self.gn_2 = AdaGN(
-            num_channels=out_channels,
-            num_groups=compute_groups(out_channels),
-        )
+        self.gn_2 = AdaGN(num_channels=out_channels, num_groups=compute_groups(out_channels))
 
-        self.t_scale_proj_1 = nn.Linear(time_dim, int_channels)
-        self.t_bias_proj_1 = nn.Linear(time_dim, int_channels)
-
-        self.t_scale_proj_2 = nn.Linear(time_dim, out_channels)
-        self.t_bias_proj_2 = nn.Linear(time_dim, out_channels)
-
-        self.z_scale_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-        self.z_bias_proj_1 = nn.Linear(latent_vec_dim, int_channels)
-
-        self.z_scale_proj_2 = nn.Linear(latent_vec_dim, out_channels)
-        self.z_bias_proj_2 = nn.Linear(latent_vec_dim, out_channels)
+        self.cond1 = ConditioningProj(time_dim, latent_vec_dim, int_channels, use_z_cond)
+        self.cond2 = ConditioningProj(time_dim, latent_vec_dim, out_channels, use_z_cond)
 
     def forward(
         self,
@@ -239,28 +239,17 @@ class UNetConv(nn.Module):
         z: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
-        # t is shape [batch_size]
-
         identity = x
 
-        t_s1 = self.t_scale_proj_1(t) if t is not None else None
-        t_b1 = self.t_bias_proj_1(t) if t is not None else None
-
-        t_s2 = self.t_scale_proj_2(t) if t is not None else None
-        t_b2 = self.t_bias_proj_2(t) if t is not None else None
-
-        z_s1 = self.z_scale_proj_1(z) if z is not None else None
-        z_b1 = self.z_bias_proj_1(z) if z is not None else None
-
-        z_s2 = self.z_scale_proj_2(z) if z is not None else None
-        z_b2 = self.z_bias_proj_2(z) if z is not None else None
+        t_s1, t_b1, z_s1, z_b1 = self.cond1(t, z)
+        t_s2, t_b2, z_s2, z_b2 = self.cond2(t, z)
 
         out = self.conv1(x)
         out = self.gn_1(out, t_s1, t_b1, z_s1, z_b1)
         out = self.gelu(out)
         out = self.conv2(out)
         out = self.gn_2(out, t_s2, t_b2, z_s2, z_b2)
-        
+
         if self.residual:
             out = out + self.shortcut(identity)
 
@@ -277,10 +266,7 @@ class DownStep(nn.Module):
         int_channels: int | None = None,
         time_dim: int = 256,
     ):
-        super(
-            DownStep,
-            self,
-        ).__init__()
+        super().__init__()
         int_channels = int_channels if int_channels else in_channels
 
         self.pooling = nn.MaxPool2d(kernel_size=2)
@@ -289,14 +275,16 @@ class DownStep(nn.Module):
             out_channels=int_channels,
             time_dim=time_dim,
             residual=True,
+            use_z_cond=False,
         )
         self.conv2 = UNetConv(
             in_channels=int_channels,
             out_channels=out_channels,
             time_dim=time_dim,
             residual=True,
+            use_z_cond=False,
         )
-        self.gdn_layer = gdn.GDN(ch=out_channels, device="cuda")
+        self.gdn_layer = gdn.GDN(ch=out_channels, device="cpu")
 
     def forward(self, x: torch.Tensor, t, z=None) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
@@ -320,15 +308,16 @@ class UpStep(nn.Module):
             out_channels=in_channels,
             residual=True,
             time_dim=time_dim,
+            use_z_cond=False,
         )
         self.conv2 = UNetConv(
             in_channels=(in_channels + res_channels),
             int_channels=(in_channels + res_channels) // 2,
             out_channels=out_channels,
             time_dim=time_dim,
+            use_z_cond=False,
         )
-
-        self.gdn_layer = gdn.GDN(ch=out_channels, device="cuda", inverse=True)
+        self.gdn_layer = gdn.GDN(ch=out_channels, device="cpu", inverse=True)
 
     def forward(self, x: torch.Tensor, res_x: torch.Tensor, t, z=None) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
@@ -339,35 +328,46 @@ class UpStep(nn.Module):
 
 
 class UpStepWoutRes(nn.Module):
-    """Upsample latent and incorporate residual"""
+    """Upsample latent without residual skip connection.
+
+    Uses plain conv+norm blocks (no conditioning projections) since
+    this path is unconditional — t and z are never passed here.
+    """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        time_dim: int = 256,
     ):
         super().__init__()
 
-        self.conv1 = UNetConv(
-            in_channels=in_channels,
-            out_channels=in_channels,
-            time_dim=time_dim,
+        # Plain conv block (no AdaGN conditioning needed)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1,
+                      bias=False, padding_mode="circular"),
+            nn.GroupNorm(num_groups=compute_groups(in_channels), num_channels=in_channels),
+            nn.GELU(),
         )
 
-        self.conv2 = UpsamplingUNetConv(
-            in_channels=in_channels,
-            int_channels=in_channels // 2,
-            out_channels=out_channels,
-            residual=True,
-            time_dim=time_dim,
+        # Upsampling conv block via pixel shuffle
+        int_ch = in_channels // 2
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_channels, int_ch, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=compute_groups(int_ch), num_channels=int_ch),
+            nn.GELU(),
+            subpel_conv3x3(in_ch=int_ch, out_ch=out_channels, r=2),
+            nn.GroupNorm(num_groups=compute_groups(out_channels), num_channels=out_channels),
+        )
+        # Residual shortcut for the upsampling step
+        self.shortcut = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Overloads forward method of nn.Module"""
         x = self.conv1(x)
-        x = self.conv2(x)
-        return x
+        return self.conv2(x) + self.shortcut(x)
 
 
 class UNet(nn.Module):
@@ -386,6 +386,7 @@ class UNet(nn.Module):
         self.n_channels = n_channels
         self.num_latent_channels = latent_img_channels
         self.use_temporal_masking = use_temporal_masking
+        self.latent_vec_dim = latent_vec_dim
 
         self.dropout = nn.Dropout2d(p=0.1)
         self.inc = UNetConv(
@@ -410,10 +411,10 @@ class UNet(nn.Module):
                 self.downs.append(SelfAttention(channels=down_channels[i + 1]))
 
         # Upsampling stages
-        up_in_ch = [512, 256, 256, 128]
+        up_in_ch  = [512, 256, 256, 128]
         up_res_ch = [512, 256, 128, 64 + self.num_latent_channels]
         up_out_ch = [256, 256, 128, 64]
-        
+
         self.ups = nn.ModuleList()
         for i in range(len(up_in_ch)):
             self.ups.append(
@@ -439,24 +440,19 @@ class UNet(nn.Module):
         self.latent_upsampler_0 = nn.Sequential(
             *[
                 UpStepWoutRes(
-                    in_channels=int(self.num_latent_channels),
-                    out_channels=int(self.num_latent_channels),
-                    time_dim=time_dim,
+                    in_channels=self.num_latent_channels,
+                    out_channels=self.num_latent_channels,
                 )
-                for _ in range(4)
+                for _ in range(5)
             ]
         )
 
-        self.latent_vec_dim = latent_vec_dim
-
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(self.num_latent_channels, 14 * 9)
+        self.fc = nn.Linear(self.num_latent_channels, self.latent_vec_dim)
 
     def pos_encoding(self, t: int, channels: int) -> torch.Tensor:
         """Generate sinusoidal timestep embedding"""
-        device = (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        device = t.device
         inv_freq = 1.0 / (
             10000 ** (torch.arange(0, channels, 2, device=device).float() / channels)
         )
@@ -484,22 +480,13 @@ class UNet(nn.Module):
             t = t.expand(B, t.shape[0])
 
         if self.use_temporal_masking:
-            for b in range(B):
-                t_val = float(t[b])
-                num_mask = int(C * t_val)
-                unmasked = C - num_mask
+            # Vectorized masking: zero out channels beyond the keep threshold
+            num_keep = (C * (1.0 - t)).long().clamp(0, C)  # [B, 1]
+            channel_idx = torch.arange(C, device=spatial.device)  # [C]
+            mask = channel_idx[None, :] < num_keep          # [B, C]
+            spatial = spatial * mask[:, :, None, None]
 
-                # index of the last channel we want to keep gradients on
-                last_unmasked = unmasked - 1
-                # zero-out everything *after* last_unmasked
-                if num_mask > 0:
-                    spatial[b, last_unmasked + 1 :, ...] = 0
-
-        # --- End of masking ---
-
-        vec_latent = self.fc(self.pool(spatial).squeeze())
-        if vec_latent.dim() == 1:
-            vec_latent = vec_latent.unsqueeze(0)
+        vec_latent = self.fc(self.pool(spatial).flatten(1))  # always [B, latent_vec_dim]
 
         t = self.pos_encoding(t, self.time_dim)
 
@@ -514,7 +501,7 @@ class UNet(nn.Module):
         )
         skips = [x1]
         x_stage = x1
-        
+
         for layer in self.downs:
             if isinstance(layer, DownStep):
                 x_stage = layer(x_stage, t)

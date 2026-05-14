@@ -19,7 +19,7 @@ torch.cuda.empty_cache()
 torch.set_float32_matmul_precision('medium')
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
 
 def get_camels_dataloaders(
     batch_size,
@@ -121,7 +121,8 @@ def train(args):
     def init_weights(m):
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, a=0, mode="fan_in", nonlinearity="relu")
-            m.bias.data.fill_(0.01)
+            if m.bias is not None:
+                m.bias.data.fill_(0.01)
     
     fm.apply(init_weights)
     fm.train()
@@ -152,8 +153,9 @@ def train(args):
         val_check_interval=args.eval_every,
         max_epochs=args.max_epochs,
         profiler="simple" if args.profile else None,
-        strategy="ddp_find_unused_parameters_true",
+        strategy="ddp",
         accelerator="gpu",
+        precision="bf16-mixed",
     )
 
     # ------------------------

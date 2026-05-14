@@ -77,8 +77,6 @@ class CosmoFlow(LightningModule):
         batch: Tuple[torch.Tensor, torch.Tensor],
         *args,
     ) -> torch.Tensor:
-        # Note: optimizer.step() is intentionally called here
-        self.optimizers().step()
         loss = self.get_loss(batch)
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
@@ -100,7 +98,6 @@ class CosmoFlow(LightningModule):
             self._log_figures(batch)
 
         self.validation_step_outputs.clear()
-        self.optimizers().step()
 
     @utilities.rank_zero_only
     def _log_figures(

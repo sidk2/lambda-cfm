@@ -7,3 +7,10 @@ __pycache__
 *.pt
 src/cosmo_compression/results/*
 *.egg-info/
+checkpoints/
+examples/
+results/
+.vscode/
+data/
+.venv/
+.ruff_cache/

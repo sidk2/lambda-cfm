@@ -85,7 +85,7 @@ class ResNet(nn.Module):
                 self._make_layer(in_channels=64, out_channels=64, num_blocks=1, stride=1),
                 self._make_layer(in_channels=64, out_channels=128, num_blocks=1, stride=2),
                 self._make_layer(in_channels=128, out_channels=128, num_blocks=1, stride=2),
-                self._make_layer(in_channels=128, out_channels=256, num_blocks=1, stride=1),
+                self._make_layer(in_channels=128, out_channels=256, num_blocks=1, stride=2),
                 self._make_layer(in_channels=256, out_channels=256, num_blocks=1, stride=2),
             ]
         )

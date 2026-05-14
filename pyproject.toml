@@ -8,9 +8,6 @@ build-backend = "setuptools.build_meta"
 name = "cosmo_compression"               # must be unique within one Python env
 version = "0.0.0"                        # any placeholder string is fine
 
-[tool.setuptools]
-package-dir = {"" = "src"}               # <-- only extra line for the src layout
-
 dependencies = [
   "lightning==2.5.1",
   "matplotlib==3.10.3",
@@ -26,3 +23,6 @@ dependencies = [
   "tqdm==4.67.1",
   "wandb==0.21.0",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}               # <-- only extra line for the src layout
