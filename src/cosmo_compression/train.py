@@ -19,7 +19,7 @@ torch.cuda.empty_cache()
 torch.set_float32_matmul_precision('medium')
 
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0, 2,3,4,5"
 
 def get_camels_dataloaders(
     batch_size,
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_every", default=50, type=int)
     parser.add_argument("--eval_every", default=50, type=int)
     parser.add_argument("--latent_dim", default=256, type=int)
-    parser.add_argument("--latent_img_channels", type=int, default=8)
+    parser.add_argument("--latent_img_channels", type=int, default=32)
 
     # ── Data subset sizes (for small‐scale fine‐tuning) ───────
     parser.add_argument(

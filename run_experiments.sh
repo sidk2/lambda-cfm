@@ -10,7 +10,7 @@ set -e
 ROOT_DIR="/monolith/global_data/astro_compression/CAMELS/"
 OUTPUT_DIR="./checkpoints/4x4_models/"
 
-SEEDS=(42 137 2026) # Add or change random seeds as needed
+SEEDS=(57 29 863) # Add or change random seeds as needed
 TRAIN_SIZE=13000
 VAL_SIZE=1000
 GPUS=6
@@ -44,7 +44,7 @@ for SEED in "${SEEDS[@]}"; do
     RUN_NAME="cosmoflow_seed_${SEED}_without_masking"
     echo "➡️ Training WITHOUT temporal masking ($RUN_NAME)..."
     
-    python3 src/cosmo_compression/train.py \
+    uv run src/cosmo_compression/train.py \
         --root "$ROOT_DIR" \
         --output_dir "$OUTPUT_DIR" \
         --run_name "$RUN_NAME" \
