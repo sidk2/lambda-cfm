@@ -481,7 +481,7 @@ class UNet(nn.Module):
 
         if self.use_temporal_masking:
             # Vectorized masking: zero out channels beyond the keep threshold
-            num_keep = (C * (1.0 - t)).long().clamp(0, C)  # [B, 1]
+            num_keep = ((C-1) * (1 - t) + 1).long().clamp(0, C)  # [B, 1]
             channel_idx = torch.arange(C, device=spatial.device)  # [C]
             mask = channel_idx[None, :] < num_keep          # [B, C]
             spatial = spatial * mask[:, :, None, None]

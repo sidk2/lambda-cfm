@@ -8,9 +8,9 @@ set -e
 # IMPORTANT: Update ROOT_DIR to point to your actual CAMELS dataset directory!
 # ==============================================================================
 ROOT_DIR="/monolith/global_data/astro_compression/CAMELS/"
-OUTPUT_DIR="./checkpoints/4x4_models/"
+OUTPUT_DIR="./checkpoints/8x8_models_upsampler/"
 
-SEEDS=(57 29 863) # Add or change random seeds as needed
+SEEDS=(861 670 2104 90 1572) # Add or change random seeds as needed
 TRAIN_SIZE=13000
 VAL_SIZE=1000
 GPUS=6
