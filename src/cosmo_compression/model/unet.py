@@ -113,11 +113,17 @@ class SelfAttention(nn.Module):
         return x_flat.transpose(1, 2).view(B, C, H, W)
 
 
-def subpel_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
-    """3x3 sub-pixel convolution for up-sampling."""
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch * r**2, kernel_size=3, padding=1), nn.PixelShuffle(r)
-    )
+def interpolate_conv3x3(in_ch: int, out_ch: int, r: int = 1) -> nn.Sequential:
+    """Upsampling using interpolation followed by 3x3 convolution."""
+    if r > 1:
+        return nn.Sequential(
+            nn.Upsample(scale_factor=r, mode="nearest"),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        )
+    else:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        )
 
 
 class UpsamplingUNetConv(nn.Module):
@@ -153,7 +159,7 @@ class UpsamplingUNetConv(nn.Module):
         )
         self.gn_1 = AdaGN(num_channels=int_channels, num_groups=compute_groups(int_channels))
         self.gelu = nn.GELU()
-        self.conv2 = subpel_conv3x3(in_ch=int_channels, out_ch=out_channels, r=2)
+        self.conv2 = interpolate_conv3x3(in_ch=int_channels, out_ch=out_channels, r=2)
         self.gn_2 = AdaGN(num_channels=out_channels, num_groups=compute_groups(out_channels))
 
         self.cond1 = ConditioningProj(time_dim, latent_vec_dim, int_channels, use_z_cond)
@@ -355,7 +361,7 @@ class UpStepWoutRes(nn.Module):
             nn.Conv2d(in_channels, int_ch, kernel_size=3, padding=1),
             nn.GroupNorm(num_groups=compute_groups(int_ch), num_channels=int_ch),
             nn.GELU(),
-            subpel_conv3x3(in_ch=int_ch, out_ch=out_channels, r=2),
+            interpolate_conv3x3(in_ch=int_ch, out_ch=out_channels, r=2),
             nn.GroupNorm(num_groups=compute_groups(out_channels), num_channels=out_channels),
         )
         # Residual shortcut for the upsampling step
