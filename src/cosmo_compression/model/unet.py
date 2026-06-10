@@ -346,28 +346,36 @@ class UpStepWoutRes(nn.Module):
         out_channels: int,
     ):
         super().__init__()
+        assert in_channels == out_channels, "Depthwise conv requires same input/output channels"
 
         # Plain conv block (no AdaGN conditioning needed)
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1,
-                      bias=False, padding_mode="circular"),
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+                padding_mode="circular",
+                groups=in_channels,
+            ),
             nn.GroupNorm(num_groups=compute_groups(in_channels), num_channels=in_channels),
             nn.GELU(),
         )
 
-        # Upsampling conv block via pixel shuffle
-        int_ch = in_channels // 2
+        # Upsampling conv block via nearest interpolation + depthwise convolutions
         self.conv2 = nn.Sequential(
-            nn.Conv2d(in_channels, int_ch, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=compute_groups(int_ch), num_channels=int_ch),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels),
+            nn.GroupNorm(num_groups=compute_groups(in_channels), num_channels=in_channels),
             nn.GELU(),
-            interpolate_conv3x3(in_ch=int_ch, out_ch=out_channels, r=2),
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, groups=in_channels),
             nn.GroupNorm(num_groups=compute_groups(out_channels), num_channels=out_channels),
         )
         # Residual shortcut for the upsampling step
         self.shortcut = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False, groups=in_channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
