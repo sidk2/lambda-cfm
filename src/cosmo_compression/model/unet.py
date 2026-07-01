@@ -9,6 +9,9 @@ from cosmo_compression.model import gdn
 
 def compute_groups(channels: int) -> int:
     """Compute the number of groups for GroupNorm"""
+    if channels <= 0:
+        raise ValueError(f"GroupNorm channel count must be positive, got {channels}")
+
     num_groups = 1
     while channels % 2 == 0:
         channels //= 2
@@ -350,7 +353,7 @@ class UpStepWoutRes(nn.Module):
         )
 
         # Upsampling conv block via pixel shuffle
-        int_ch = in_channels // 2
+        int_ch = max(1, in_channels // 2)
         self.conv2 = nn.Sequential(
             nn.Conv2d(in_channels, int_ch, kernel_size=3, padding=1),
             nn.GroupNorm(num_groups=compute_groups(int_ch), num_channels=int_ch),
